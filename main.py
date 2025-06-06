@@ -15,6 +15,16 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI(title="TDS Virtual TA", description="Virtual Teaching Assistant for Tools in Data Science")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or replace with your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Request/Response Models
 class QuestionRequest(BaseModel):
     question: str
