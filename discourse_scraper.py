@@ -1,199 +1,192 @@
 import requests
 import json
 import time
-from datetime import datetime, timedelta
+import sys
+from datetime import datetime
 from typing import List, Dict, Optional
 import argparse
+import re
+import logging
 
-class DiscourseScraper:
-    def __init__(self, base_url: str, api_key: Optional[str] = None):
-        """
-        Initialize the discourse scraper
-        
-        Args:
-            base_url: Base URL of the discourse instance (e.g., https://discourse.onlinedegree.iitm.ac.in)
-            api_key: Optional API key for authenticated requests
-        """
+# =============================================================================
+# CONFIGURATION - Replace this with your own cookie value
+# =============================================================================
+
+DISCOURSE_COOKIE_T = "YOUR_COOKIE_HERE"  # 🔴 Replace this string with your actual _t cookie
+
+BASE_URL = "https://discourse.onlinedegree.iitm.ac.in"
+CATEGORY_SLUG = "courses/tds-kb/34"  # Set to None for all categories
+START_DATE = "2025-01-01T00:00:00.000Z"
+END_DATE = "2025-04-14T23:59:59.999Z"
+OUTPUT_FILE = "DiscourseData.jsonl"
+MAX_TOPICS = None  # Set to a number to limit, or None for all
+
+# =============================================================================
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class EnhancedDiscourseScraper:
+    def __init__(self, base_url: str, cookies: Dict[str, str]):
         self.base_url = base_url.rstrip('/')
-        self.api_key = api_key
         self.session = requests.Session()
-        
-        if api_key:
-            self.session.headers.update({
-                'Api-Key': api_key,
-                'Api-Username': 'system'
-            })
-    
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        self.session.cookies.update(cookies)
+        logger.info("Session initialized with authentication.")
+
+    def make_request(self, url: str, params: Optional[Dict] = None, retries: int = 3) -> Optional[Dict]:
+        for attempt in range(retries):
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                if 'application/json' in response.headers.get('Content-Type', ''):
+                    return response.json()
+                else:
+                    logger.warning(f"Non-JSON response from {url}")
+                    return None
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request failed ({attempt+1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+        logger.error(f"Failed to fetch {url}")
+        return None
+
     def get_category_topics(self, category_slug: str, page: int = 0) -> List[Dict]:
-        """Get topics from a specific category"""
         url = f"{self.base_url}/c/{category_slug}.json"
-        params = {'page': page}
-        
-        try:
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            return data.get('topic_list', {}).get('topics', [])
-        except Exception as e:
-            print(f"Error fetching topics from category {category_slug}: {e}")
-            return []
-    
-    def get_topic_posts(self, topic_id: int) -> List[Dict]:
-        """Get all posts from a specific topic"""
-        url = f"{self.base_url}/t/{topic_id}.json"
-        
-        try:
-            response = self.session.get(url)
-            response.raise_for_status()
-            data = response.json()
-            
-            posts = []
-            for post in data.get('post_stream', {}).get('posts', []):
-                posts.append({
-                    'id': post['id'],
-                    'topic_id': topic_id,
-                    'url': f"{self.base_url}/t/{topic_id}/{post['post_number']}",
-                    'username': post['username'],
-                    'content': post['cooked'],  # HTML content
-                    'raw_content': post.get('raw', ''),  # Raw markdown
-                    'created_at': post['created_at'],
-                    'updated_at': post['updated_at'],
-                    'post_number': post['post_number']
-                })
-            
-            return posts
-        except Exception as e:
-            print(f"Error fetching posts from topic {topic_id}: {e}")
-            return []
-    
+        data = self.make_request(url, params={'page': page})
+        return data.get('topic_list', {}).get('topics', []) if data else []
+
+    def get_all_category_topics(self, category_slug: str, max_pages: int = 10) -> List[Dict]:
+        all_topics, page = [], 0
+        while page < max_pages:
+            topics = self.get_category_topics(category_slug, page)
+            if not topics:
+                break
+            all_topics.extend(topics)
+            page += 1
+            time.sleep(1)
+        return all_topics
+
     def get_latest_topics(self, limit: int = 50) -> List[Dict]:
-        """Get latest topics from the discourse instance"""
         url = f"{self.base_url}/latest.json"
-        params = {'limit': limit}
-        
+        data = self.make_request(url, params={'limit': limit})
+        return data.get('topic_list', {}).get('topics', []) if data else []
+
+    def get_topic_posts(self, topic_id: int) -> List[Dict]:
+        url = f"{self.base_url}/t/{topic_id}.json"
+        data = self.make_request(url)
+        posts = []
+        if not data:
+            return posts
+        title = data.get('title', 'Untitled')
+        for post in data.get('post_stream', {}).get('posts', []):
+            posts.append({
+                'id': post['id'],
+                'topic_id': topic_id,
+                'topic_title': title,
+                'url': f"{self.base_url}/t/{topic_id}/{post['post_number']}",
+                'username': post['username'],
+                'content': post['cooked'],
+                'raw_content': post.get('raw', ''),
+                'created_at': post['created_at'],
+                'post_number': post['post_number'],
+                'reply_count': post.get('reply_count', 0),
+                'like_count': post.get('actions_summary', [{}])[0].get('count', 0)
+            })
+        return posts
+
+    def clean_html(self, html: str) -> str:
+        text = re.sub(r'<[^>]+>', '', html)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def filter_by_date(self, posts: List[Dict], start: str, end: str) -> List[Dict]:
         try:
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            return data.get('topic_list', {}).get('topics', [])
-        except Exception as e:
-            print(f"Error fetching latest topics: {e}")
-            return []
-    
-    def filter_posts_by_date(self, posts: List[Dict], start_date: str, end_date: str) -> List[Dict]:
-        """Filter posts by date range"""
-        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-        
-        filtered_posts = []
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except ValueError:
+            logger.error("Invalid date format")
+            return posts
+        result = []
         for post in posts:
-            post_dt = datetime.fromisoformat(post['created_at'].replace('Z', '+00:00'))
-            if start_dt <= post_dt <= end_dt:
-                filtered_posts.append(post)
-        
-        return filtered_posts
-    
-    def scrape_discourse_data(self, 
-                            start_date: str = "2025-01-01T00:00:00.000Z",
-                            end_date: str = "2025-04-14T23:59:59.999Z",
-                            category_slug: str = None,
-                            output_file: str = "DiscourseData.jsonl") -> List[Dict]:
-        """
-        Scrape discourse data within a date range
-        
-        Args:
-            start_date: Start date in ISO format
-            end_date: End date in ISO format
-            category_slug: Optional category to filter by
-            output_file: Output file name
-        """
+            try:
+                created = datetime.fromisoformat(post['created_at'].replace("Z", "+00:00"))
+                if start_dt <= created <= end_dt:
+                    result.append(post)
+            except Exception:
+                continue
+        return result
+
+    def scrape_discourse_data(self, start_date: str, end_date: str, category_slug: str, output_file: str, max_topics: Optional[int] = None) -> List[Dict]:
+        topics = self.get_all_category_topics(category_slug) if category_slug else self.get_latest_topics(limit=200)
+        if max_topics:
+            topics = topics[:max_topics]
+        logger.info(f"Processing {len(topics)} topics")
+
         all_posts = []
-        
-        print(f"Scraping discourse data from {start_date} to {end_date}")
-        
-        # Get topics based on category or latest
-        if category_slug:
-            print(f"Fetching topics from category: {category_slug}")
-            topics = self.get_category_topics(category_slug)
-        else:
-            print("Fetching latest topics")
-            topics = self.get_latest_topics(limit=100)
-        
-        print(f"Found {len(topics)} topics to process")
-        
-        # Process each topic
-        for i, topic in enumerate(topics):
+        for topic in topics:
             topic_id = topic['id']
-            topic_title = topic['title']
-            
-            print(f"Processing topic {i+1}/{len(topics)}: {topic_title}")
-            
-            # Get posts from this topic
             posts = self.get_topic_posts(topic_id)
-            
-            # Filter by date range
-            filtered_posts = self.filter_posts_by_date(posts, start_date, end_date)
-            
-            # Clean and format posts
-            for post in filtered_posts:
-                # Remove HTML tags from content for cleaner text
-                import re
-                clean_content = re.sub(r'<[^>]+>', '', post['content'])
-                clean_content = re.sub(r'\n+', '\n', clean_content).strip()
-                
-                cleaned_post = {
-                    'id': post['id'],
-                    'topic_id': post['topic_id'],
-                    'url': post['url'],
-                    'username': post['username'],
-                    'content': clean_content,
-                    'created_at': post['created_at'],
-                    'topic_title': topic_title
-                }
-                
-                all_posts.append(cleaned_post)
-            
-            # Rate limiting
+            posts = self.filter_by_date(posts, start_date, end_date)
+            for post in posts:
+                content = self.clean_html(post['content'])
+                if not content.strip():
+                    continue
+                post['content'] = content
+                all_posts.append(post)
             time.sleep(0.5)
-        
-        print(f"Scraped {len(all_posts)} posts total")
-        
-        # Save to JSONL file
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for post in all_posts:
-                f.write(json.dumps(post, ensure_ascii=False) + '\n')
-        
-        print(f"Data saved to {output_file}")
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for post in all_posts:
+                    f.write(json.dumps(post, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.error(f"Failed to write output: {e}")
         return all_posts
 
-def main():
-    parser = argparse.ArgumentParser(description='Scrape Discourse posts within a date range')
-    parser.add_argument('--base-url', required=True, help='Base URL of the discourse instance')
-    parser.add_argument('--start-date', default='2025-01-01T00:00:00.000Z', help='Start date (ISO format)')
-    parser.add_argument('--end-date', default='2025-04-14T23:59:59.999Z', help='End date (ISO format)')
-    parser.add_argument('--category', help='Category slug to filter by')
-    parser.add_argument('--api-key', help='Discourse API key (optional)')
-    parser.add_argument('--output', default='DiscourseData.jsonl', help='Output file name')
-    
-    args = parser.parse_args()
-    
-    # Initialize scraper
-    scraper = DiscourseScraper(args.base_url, args.api_key)
-    
-    # Scrape data
+
+def quick_run():
+    if DISCOURSE_COOKIE_T == "YOUR_COOKIE_HERE":
+        print("❌ Please set DISCOURSE_COOKIE_T to your actual '_t' cookie.")
+        return
+    cookies = {"_t": DISCOURSE_COOKIE_T}
+    scraper = EnhancedDiscourseScraper(BASE_URL, cookies)
+    print("🚀 Starting scraper...")
     posts = scraper.scrape_discourse_data(
-        start_date=args.start_date,
-        end_date=args.end_date,
-        category_slug=args.category,
-        output_file=args.output
+        start_date=START_DATE,
+        end_date=END_DATE,
+        category_slug=CATEGORY_SLUG,
+        output_file=OUTPUT_FILE,
+        max_topics=MAX_TOPICS
     )
-    
-    print(f"Scraping completed! Found {len(posts)} posts.")
+    print(f"✅ Finished. {len(posts)} posts saved to {OUTPUT_FILE}")
+
+def main():
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--base-url', required=True)
+        parser.add_argument('--cookie-token', required=True)
+        parser.add_argument('--start-date', required=True)
+        parser.add_argument('--end-date', required=True)
+        parser.add_argument('--category', required=False)
+        parser.add_argument('--output', required=True)
+        parser.add_argument('--max-topics', type=int, default=None)
+        args = parser.parse_args()
+
+        cookies = {"_t": args.cookie_token}
+        scraper = EnhancedDiscourseScraper(args.base_url, cookies)
+        scraper.scrape_discourse_data(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            category_slug=args.category,
+            output_file=args.output,
+            max_topics=args.max_topics
+        )
+    else:
+        quick_run()
 
 if __name__ == "__main__":
     main()
-
-# Example usage:
-# python discourse_scraper.py --base-url https://discourse.onlinedegree.iitm.ac.in --start-date 2025-01-01T00:00:00.000Z --end-date 2025-04-14T23:59:59.999Z
