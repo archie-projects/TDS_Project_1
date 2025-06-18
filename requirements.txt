@@ -8,3 +8,11 @@ numpy
 pydantic
 pytesseract 
 pillow
+fastapi
+uvicorn
+pydantic
+requests
+numpy
+scikit-learn
+pillow
+pytesseract

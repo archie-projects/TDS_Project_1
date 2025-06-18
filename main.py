@@ -9,7 +9,7 @@ import uvicorn
 import requests
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import time
@@ -17,7 +17,8 @@ from PIL import Image
 import pytesseract
 import io
 
-load_dotenv()
+# load_dotenv()
+
 
 app = FastAPI(title="TDS Virtual TA", description="Virtual Teaching Assistant for Tools in Data Science")
 
